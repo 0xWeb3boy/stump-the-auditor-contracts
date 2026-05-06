@@ -99,12 +99,9 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
     /// @param asset The reserve asset being supplied.
     /// @param amount The raw token amount to supply.
     /// @param onBehalfOf The account credited with the resulting scaled balance.
-    function supply(address asset, uint256 amount, address onBehalfOf) external nonReentrant whenNotPaused {
+    function supply(address asset, uint256 amount, address onBehalfOf) external virtual nonReentrant whenNotPaused {
         if (amount == 0) revert ZeroAmount();
         if (onBehalfOf == address(0)) revert ZeroAddress();
-
-        _accrueInterest(asset);
-
         Reserve storage reserve = _getReserveStorage(asset);
         IERC20 token = IERC20(asset);
         uint256 balanceBefore = token.balanceOf(address(this));
@@ -112,9 +109,10 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
         uint256 received = token.balanceOf(address(this)) - balanceBefore;
         if (received != amount) revert UnsupportedToken(asset);
 
-        // rounding: supply mints scaled balance DOWN to favor the protocol.
         uint256 scaledAmount = Math.mulDiv(amount, RAY, reserve.supplyIndex);
         if (scaledAmount == 0) revert ZeroAmount();
+
+        _accrueInterest(asset);
 
         userScaledSupply[onBehalfOf][asset] += scaledAmount;
         reserve.totalScaledSupply = (uint256(reserve.totalScaledSupply) + scaledAmount).toUint128();
@@ -133,7 +131,7 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
     /// @param amount The raw token amount to withdraw, or `type(uint256).max` for the full balance.
     /// @param to The recipient of the withdrawn tokens.
     /// @return withdrawn The actual token amount withdrawn.
-    function withdraw(address asset, uint256 amount, address to) external nonReentrant returns (uint256 withdrawn) {
+    function withdraw(address asset, uint256 amount, address to) external virtual nonReentrant returns (uint256 withdrawn) {
         if (amount == 0) revert ZeroAmount();
         if (to == address(0)) revert ZeroAddress();
 
@@ -146,20 +144,19 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
 
         withdrawn = amount == type(uint256).max ? supplyBalance : Math.min(amount, supplyBalance);
 
-        // rounding: withdraw burns scaled balance UP to favor the protocol.
         uint256 scaledAmount = Math.mulDiv(withdrawn, RAY, reserve.supplyIndex, Math.Rounding.Ceil);
         if (scaledAmount > scaledBalance) scaledAmount = scaledBalance;
+
+        if (_userHasDebt(msg.sender)) {
+            (,,, uint256 healthFactor) = _getUserAccountData(msg.sender);
+            if (healthFactor < MIN_HEALTH_FACTOR) revert HealthFactorBelowThreshold(healthFactor);
+        }
 
         userScaledSupply[msg.sender][asset] = scaledBalance - scaledAmount;
         reserve.totalScaledSupply = (uint256(reserve.totalScaledSupply) - scaledAmount).toUint128();
 
         if (userScaledSupply[msg.sender][asset] == 0 && _hasCollateral[msg.sender][asset]) {
             _removeCollateralAsset(msg.sender, asset);
-        }
-
-        if (_userHasDebt(msg.sender)) {
-            (,,, uint256 healthFactor) = _getUserAccountData(msg.sender);
-            if (healthFactor < MIN_HEALTH_FACTOR) revert HealthFactorBelowThreshold(healthFactor);
         }
 
         uint256 liquidity = _availableLiquidity(asset, reserve.accruedReserves);
@@ -175,7 +172,7 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
     /// @param asset The reserve asset to borrow.
     /// @param amount The raw token amount to borrow.
     /// @param to The recipient of the borrowed tokens.
-    function borrow(address asset, uint256 amount, address to) external nonReentrant whenNotPaused {
+    function borrow(address asset, uint256 amount, address to) external virtual nonReentrant whenNotPaused {
         if (amount == 0) revert ZeroAmount();
         if (to == address(0)) revert ZeroAddress();
 
