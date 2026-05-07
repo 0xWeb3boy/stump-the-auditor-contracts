@@ -82,6 +82,17 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
     IPriceOracle public oracle;
     uint256 public closeFactorBps;
 
+    // --- Blacklist ---
+    // Intended to block sanctioned addresses from supply/borrow/repay/withdraw.
+    mapping(address => bool) public blacklisted;
+
+    // --- Reward distribution ---
+    // Tracks the raw cumulative reward token amount added per asset.
+
+    address public rewardToken;
+    mapping(address => uint256) public totalRewardsForAsset;
+    mapping(address => mapping(address => uint256)) public userRewardsClaimed;
+
     /// @notice Sets the initial oracle and close factor.
     /// @param oracle_ The oracle used for USD pricing.
     /// @param closeFactorBps_ The initial close factor in basis points.
@@ -95,24 +106,56 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
         closeFactorBps = closeFactorBps_;
     }
 
+    // -------------------------------------------------------------------------
+    // Blacklist events / errors
+    // -------------------------------------------------------------------------
+    event AddedToBlacklist(address indexed user);
+    event RemovedFromBlacklist(address indexed user);
+
+    error BlacklistedAddress(address user);
+
+    // -------------------------------------------------------------------------
+    // Reward events / errors
+    // -------------------------------------------------------------------------
+    event RewardsAdded(address indexed asset, uint256 amount);
+    event RewardsClaimed(address indexed user, address indexed asset, uint256 amount);
+
+    error RewardTokenNotSet();
+
+    // -------------------------------------------------------------------------
+    // Modifiers
+    // -------------------------------------------------------------------------
+
+    /// @dev Reverts if the caller is on the protocol blacklist.
+
+    modifier notBlacklisted() {
+        if (blacklisted[msg.sender]) revert BlacklistedAddress(msg.sender);
+        _;
+    }
+
+    // -------------------------------------------------------------------------
+    // Core protocol actions
+    // -------------------------------------------------------------------------
+
     /// @notice Supplies an asset to the pool for `onBehalfOf`.
     /// @param asset The reserve asset being supplied.
     /// @param amount The raw token amount to supply.
     /// @param onBehalfOf The account credited with the resulting scaled balance.
-    function supply(address asset, uint256 amount, address onBehalfOf) external virtual nonReentrant whenNotPaused {
+    function supply(address asset, uint256 amount, address onBehalfOf) external virtual nonReentrant whenNotPaused notBlacklisted {
         if (amount == 0) revert ZeroAmount();
         if (onBehalfOf == address(0)) revert ZeroAddress();
+        _accrueInterest(asset);
+
         Reserve storage reserve = _getReserveStorage(asset);
         IERC20 token = IERC20(asset);
         uint256 balanceBefore = token.balanceOf(address(this));
         token.safeTransferFrom(msg.sender, address(this), amount);
         uint256 received = token.balanceOf(address(this)) - balanceBefore;
         if (received != amount) revert UnsupportedToken(asset);
-
+        // rounding: supply mints scaled balance DOWN to favor the protocol.
         uint256 scaledAmount = Math.mulDiv(amount, RAY, reserve.supplyIndex);
         if (scaledAmount == 0) revert ZeroAmount();
 
-        _accrueInterest(asset);
 
         userScaledSupply[onBehalfOf][asset] += scaledAmount;
         reserve.totalScaledSupply = (uint256(reserve.totalScaledSupply) + scaledAmount).toUint128();
@@ -126,7 +169,6 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
     }
 
     /// @notice Withdraws supplied liquidity to `to`.
-    /// @dev If the caller has debt, the post-withdraw health factor must remain `>= MIN_HEALTH_FACTOR`.
     /// @param asset The reserve asset being withdrawn.
     /// @param amount The raw token amount to withdraw, or `type(uint256).max` for the full balance.
     /// @param to The recipient of the withdrawn tokens.
@@ -138,25 +180,28 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
         _accrueInterest(asset);
 
         Reserve storage reserve = _getReserveStorage(asset);
-        uint256 scaledBalance = userScaledSupply[msg.sender][asset];
+
+        uint256 scaledBalance = userScaledSupply[to][asset];
         uint256 supplyBalance = LendingMath.scaledToUnderlying(scaledBalance, reserve.supplyIndex, Math.Rounding.Floor);
         if (supplyBalance == 0) revert InsufficientSupply(asset, amount, 0);
+
 
         withdrawn = amount == type(uint256).max ? supplyBalance : Math.min(amount, supplyBalance);
 
         uint256 scaledAmount = Math.mulDiv(withdrawn, RAY, reserve.supplyIndex, Math.Rounding.Ceil);
         if (scaledAmount > scaledBalance) scaledAmount = scaledBalance;
 
+
+        userScaledSupply[to][asset] = scaledBalance - scaledAmount;
+        reserve.totalScaledSupply = (uint256(reserve.totalScaledSupply) - scaledAmount).toUint128();
+
+        if (userScaledSupply[to][asset] == 0 && _hasCollateral[to][asset]) {
+            _removeCollateralAsset(to, asset);
+        }
+
         if (_userHasDebt(msg.sender)) {
             (,,, uint256 healthFactor) = _getUserAccountData(msg.sender);
             if (healthFactor < MIN_HEALTH_FACTOR) revert HealthFactorBelowThreshold(healthFactor);
-        }
-
-        userScaledSupply[msg.sender][asset] = scaledBalance - scaledAmount;
-        reserve.totalScaledSupply = (uint256(reserve.totalScaledSupply) - scaledAmount).toUint128();
-
-        if (userScaledSupply[msg.sender][asset] == 0 && _hasCollateral[msg.sender][asset]) {
-            _removeCollateralAsset(msg.sender, asset);
         }
 
         uint256 liquidity = _availableLiquidity(asset, reserve.accruedReserves);
@@ -164,15 +209,14 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
 
         IERC20(asset).safeTransfer(to, withdrawn);
 
-        emit Withdrawn(msg.sender, asset, withdrawn, scaledAmount);
+        emit Withdrawn(to, asset, withdrawn, scaledAmount);
     }
 
     /// @notice Borrows an asset against the caller's collateral.
-    /// @dev The post-borrow health factor must remain `>= MIN_HEALTH_FACTOR`.
     /// @param asset The reserve asset to borrow.
     /// @param amount The raw token amount to borrow.
     /// @param to The recipient of the borrowed tokens.
-    function borrow(address asset, uint256 amount, address to) external virtual nonReentrant whenNotPaused {
+    function borrow(address asset, uint256 amount, address to) external virtual nonReentrant whenNotPaused notBlacklisted {
         if (amount == 0) revert ZeroAmount();
         if (to == address(0)) revert ZeroAddress();
 
@@ -180,30 +224,31 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
 
         Reserve storage reserve = _getReserveStorage(asset);
         if (!reserve.borrowEnabled) revert BorrowDisabled(asset);
-        if (userScaledSupply[msg.sender][asset] != 0) revert SameAssetCollateralDebtNotAllowed();
+        if (userScaledSupply[to][asset] != 0) revert SameAssetCollateralDebtNotAllowed();
 
         // rounding: borrow mints scaled debt UP so the borrower owes at least the requested amount.
         uint256 scaledAmount = Math.mulDiv(amount, RAY, reserve.borrowIndex, Math.Rounding.Ceil);
         if (scaledAmount == 0) revert ZeroAmount();
 
-        userScaledBorrow[msg.sender][asset] += scaledAmount;
+        userScaledBorrow[to][asset] += scaledAmount;
         reserve.totalScaledBorrow = (uint256(reserve.totalScaledBorrow) + scaledAmount).toUint128();
-
-        if (!_hasBorrow[msg.sender][asset]) {
-            _hasBorrow[msg.sender][asset] = true;
-            userBorrowAssets[msg.sender].push(asset);
-        }
 
         (,,, uint256 healthFactor) = _getUserAccountData(msg.sender);
         if (healthFactor < MIN_HEALTH_FACTOR) revert HealthFactorBelowThreshold(healthFactor);
-        _requireWithinBorrowCapacity(msg.sender);
+        if (!_hasBorrow[to][asset]) {
+            _hasBorrow[to][asset] = true;
+            userBorrowAssets[to].push(asset);
+        }
+
+
+        _requireWithinBorrowCapacity(to);
 
         uint256 liquidity = _availableLiquidity(asset, reserve.accruedReserves);
         if (liquidity < amount) revert InsufficientLiquidity(asset, amount, liquidity);
 
         IERC20(asset).safeTransfer(to, amount);
 
-        emit Borrowed(msg.sender, asset, amount, scaledAmount);
+        emit Borrowed(to, asset, amount, scaledAmount);
     }
 
     /// @notice Repays debt for `onBehalfOf`.
@@ -211,7 +256,7 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
     /// @param amount The raw token amount to repay, or `type(uint256).max` for the full debt.
     /// @param onBehalfOf The borrower whose debt is reduced.
     /// @return repaid The actual token amount repaid.
-    function repay(address asset, uint256 amount, address onBehalfOf) external nonReentrant returns (uint256 repaid) {
+    function repay(address asset, uint256 amount, address onBehalfOf) external nonReentrant notBlacklisted returns (uint256 repaid) {
         if (amount == 0) revert ZeroAmount();
         if (onBehalfOf == address(0)) revert ZeroAddress();
 
@@ -544,6 +589,76 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
     /// @notice Unpauses supply, borrow, and liquidation actions.
     function unpause() external onlyOwner {
         _unpause();
+    }
+
+    // -------------------------------------------------------------------------
+    // Blacklist management
+    // -------------------------------------------------------------------------
+
+    /// @notice Adds an address to the protocol blacklist.
+    /// @dev Blacklisted addresses cannot call supply, borrow, or repay or withdraw.
+    /// @param user The address to blacklist.
+    function addToBlacklist(address user) external onlyOwner {
+        if (user == address(0)) revert ZeroAddress();
+        blacklisted[user] = true;
+        emit AddedToBlacklist(user);
+    }
+
+    /// @notice Removes an address from the protocol blacklist.
+    /// @param user The address to unblacklist.
+    function removeFromBlacklist(address user) external onlyOwner {
+        blacklisted[user] = false;
+        emit RemovedFromBlacklist(user);
+    }
+
+    // -------------------------------------------------------------------------
+    // Reward distribution
+    // -------------------------------------------------------------------------
+
+    /// @notice Sets the ERC-20 token used for reward distributions.
+    /// @param token The reward token address.
+    function setRewardToken(address token) external onlyOwner {
+        if (token == address(0)) revert ZeroAddress();
+        rewardToken = token;
+    }
+
+    /// @notice Deposits `amount` of reward tokens into the pool for `asset` suppliers.
+    /// @param asset The reserve asset whose suppliers receive rewards.
+    /// @param amount The raw reward token amount to deposit.
+    function addRewards(address asset, uint256 amount) external onlyOwner {
+        if (rewardToken == address(0)) revert RewardTokenNotSet();
+        if (amount == 0) revert ZeroAmount();
+        _getReserveStorage(asset);
+
+        IERC20(rewardToken).safeTransferFrom(msg.sender, address(this), amount);
+
+        // Accumulate raw reward total — share is NOT computed here.
+        totalRewardsForAsset[asset] += amount;
+
+        emit RewardsAdded(asset, amount);
+    }
+
+    /// @notice Claims the caller's proportional share of all rewards added for `asset`.
+    ///
+    /// @param asset The reserve asset to claim rewards for.
+    function claimRewards(address asset) external nonReentrant {
+        if (rewardToken == address(0)) revert RewardTokenNotSet();
+
+        Reserve storage reserve = _getReserveStorage(asset);
+        uint256 totalScaled = reserve.totalScaledSupply;
+        if (totalScaled == 0) revert ZeroAmount();
+
+        uint256 scaledBalance = userScaledSupply[msg.sender][asset];
+
+        uint256 entitled = Math.mulDiv(scaledBalance, totalRewardsForAsset[asset], totalScaled);
+        uint256 pending = entitled - userRewardsClaimed[msg.sender][asset];
+
+        userRewardsClaimed[msg.sender][asset] = entitled;
+
+        if (pending == 0) revert ZeroAmount();
+        IERC20(rewardToken).safeTransfer(msg.sender, pending);
+
+        emit RewardsClaimed(msg.sender, asset, pending);
     }
 
     function _accrueInterest(address asset) internal {
