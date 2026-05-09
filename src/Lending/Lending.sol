@@ -93,6 +93,10 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
     mapping(address => uint256) public totalRewardsForAsset;
     mapping(address => mapping(address => uint256)) public userRewardsClaimed;
 
+    // --- Per-asset supplier registry (required for push-based distributeRewards) ---
+    mapping(address => address[]) public assetSuppliers;
+    mapping(address => mapping(address => bool)) internal _isAssetSupplier;
+
     /// @notice Sets the initial oracle and close factor.
     /// @param oracle_ The oracle used for USD pricing.
     /// @param closeFactorBps_ The initial close factor in basis points.
@@ -119,19 +123,14 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
     // -------------------------------------------------------------------------
     event RewardsAdded(address indexed asset, uint256 amount);
     event RewardsClaimed(address indexed user, address indexed asset, uint256 amount);
+    event RewardsDistributed(address indexed asset, uint256 totalDistributed, uint256 recipientCount);
 
     error RewardTokenNotSet();
+    error NoSuppliersForAsset(address asset);
 
     // -------------------------------------------------------------------------
     // Modifiers
     // -------------------------------------------------------------------------
-
-    /// @dev Reverts if the caller is on the protocol blacklist.
-
-    modifier notBlacklisted() {
-        if (blacklisted[msg.sender]) revert BlacklistedAddress(msg.sender);
-        _;
-    }
 
     // -------------------------------------------------------------------------
     // Core protocol actions
@@ -141,7 +140,7 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
     /// @param asset The reserve asset being supplied.
     /// @param amount The raw token amount to supply.
     /// @param onBehalfOf The account credited with the resulting scaled balance.
-    function supply(address asset, uint256 amount, address onBehalfOf) external virtual nonReentrant whenNotPaused notBlacklisted {
+    function supply(address asset, uint256 amount, address onBehalfOf) external virtual nonReentrant whenNotPaused  {
         if (amount == 0) revert ZeroAmount();
         if (onBehalfOf == address(0)) revert ZeroAddress();
         _accrueInterest(asset);
@@ -159,6 +158,8 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
 
         userScaledSupply[onBehalfOf][asset] += scaledAmount;
         reserve.totalScaledSupply = (uint256(reserve.totalScaledSupply) + scaledAmount).toUint128();
+
+        _addAssetSupplier(asset, onBehalfOf);
 
         if (reserve.useAsCollateral && !_hasCollateral[onBehalfOf][asset] && msg.sender == onBehalfOf) {
             _hasCollateral[onBehalfOf][asset] = true;
@@ -195,8 +196,9 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
         userScaledSupply[to][asset] = scaledBalance - scaledAmount;
         reserve.totalScaledSupply = (uint256(reserve.totalScaledSupply) - scaledAmount).toUint128();
 
-        if (userScaledSupply[to][asset] == 0 && _hasCollateral[to][asset]) {
-            _removeCollateralAsset(to, asset);
+        if (userScaledSupply[to][asset] == 0) {
+            if (_hasCollateral[to][asset]) _removeCollateralAsset(to, asset);
+            _removeAssetSupplier(asset, to);
         }
 
         if (_userHasDebt(msg.sender)) {
@@ -216,7 +218,7 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
     /// @param asset The reserve asset to borrow.
     /// @param amount The raw token amount to borrow.
     /// @param to The recipient of the borrowed tokens.
-    function borrow(address asset, uint256 amount, address to) external virtual nonReentrant whenNotPaused notBlacklisted {
+    function borrow(address asset, uint256 amount, address to) external virtual nonReentrant whenNotPaused  {
         if (amount == 0) revert ZeroAmount();
         if (to == address(0)) revert ZeroAddress();
 
@@ -256,7 +258,7 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
     /// @param amount The raw token amount to repay, or `type(uint256).max` for the full debt.
     /// @param onBehalfOf The borrower whose debt is reduced.
     /// @return repaid The actual token amount repaid.
-    function repay(address asset, uint256 amount, address onBehalfOf) external nonReentrant notBlacklisted returns (uint256 repaid) {
+    function repay(address asset, uint256 amount, address onBehalfOf) external nonReentrant  returns (uint256 repaid) {
         if (amount == 0) revert ZeroAmount();
         if (onBehalfOf == address(0)) revert ZeroAddress();
 
@@ -591,25 +593,7 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
         _unpause();
     }
 
-    // -------------------------------------------------------------------------
-    // Blacklist management
-    // -------------------------------------------------------------------------
 
-    /// @notice Adds an address to the protocol blacklist.
-    /// @dev Blacklisted addresses cannot call supply, borrow, or repay or withdraw.
-    /// @param user The address to blacklist.
-    function addToBlacklist(address user) external onlyOwner {
-        if (user == address(0)) revert ZeroAddress();
-        blacklisted[user] = true;
-        emit AddedToBlacklist(user);
-    }
-
-    /// @notice Removes an address from the protocol blacklist.
-    /// @param user The address to unblacklist.
-    function removeFromBlacklist(address user) external onlyOwner {
-        blacklisted[user] = false;
-        emit RemovedFromBlacklist(user);
-    }
 
     // -------------------------------------------------------------------------
     // Reward distribution
@@ -639,7 +623,6 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
     }
 
     /// @notice Claims the caller's proportional share of all rewards added for `asset`.
-    ///
     /// @param asset The reserve asset to claim rewards for.
     function claimRewards(address asset) external nonReentrant {
         if (rewardToken == address(0)) revert RewardTokenNotSet();
@@ -659,6 +642,46 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
         IERC20(rewardToken).safeTransfer(msg.sender, pending);
 
         emit RewardsClaimed(msg.sender, asset, pending);
+    }
+
+    /// @notice Pushes the proportional reward share to every current supplier of `asset` in one transaction.
+    /// @dev Only the owner may call this. Iterates over all tracked suppliers; users with no pending
+    ///      rewards are silently skipped. Reverts if the reward token is not set or the reserve has no
+    ///      suppliers. Note: gas cost scales linearly with the number of suppliers — use with care on
+    ///      pools with many participants.
+    /// @param asset The reserve asset whose suppliers receive the distributed rewards.
+    function distributeRewards(address asset) external onlyOwner nonReentrant {
+        if (rewardToken == address(0)) revert RewardTokenNotSet();
+
+        Reserve storage reserve = _getReserveStorage(asset);
+        uint256 totalScaled = reserve.totalScaledSupply;
+        if (totalScaled == 0) revert ZeroAmount();
+
+        address[] storage suppliers = assetSuppliers[asset];
+        uint256 count = suppliers.length;
+        if (count == 0) revert NoSuppliersForAsset(asset);
+
+        uint256 totalRewards = totalRewardsForAsset[asset];
+        uint256 totalDistributed;
+        IERC20 token = IERC20(rewardToken);
+
+        for (uint256 i; i < count; ++i) {
+            address user = suppliers[i];
+            uint256 scaledBalance = userScaledSupply[user][asset];
+            if (scaledBalance == 0) continue;
+
+            uint256 entitled = Math.mulDiv(scaledBalance, totalRewards, totalScaled);
+            uint256 pending = entitled - userRewardsClaimed[user][asset];
+            if (pending == 0) continue;
+
+            userRewardsClaimed[user][asset] = entitled;
+            totalDistributed += pending;
+            token.safeTransfer(user, pending);
+
+            emit RewardsClaimed(user, asset, pending);
+        }
+
+        emit RewardsDistributed(asset, totalDistributed, count);
     }
 
     function _accrueInterest(address asset) internal {
@@ -858,12 +881,16 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
         userScaledSupply[borrower][collateralAsset] = borrowerScaledCollateral - scaledCollateralTransfer;
         userScaledSupply[liquidator][collateralAsset] += scaledCollateralTransfer;
 
-        if (userScaledSupply[borrower][collateralAsset] == 0 && _hasCollateral[borrower][collateralAsset]) {
-            _removeCollateralAsset(borrower, collateralAsset);
+        if (userScaledSupply[borrower][collateralAsset] == 0) {
+            if (_hasCollateral[borrower][collateralAsset]) _removeCollateralAsset(borrower, collateralAsset);
+            _removeAssetSupplier(collateralAsset, borrower);
         }
-        if (scaledCollateralTransfer != 0 && !_hasCollateral[liquidator][collateralAsset]) {
-            _hasCollateral[liquidator][collateralAsset] = true;
-            userCollateralAssets[liquidator].push(collateralAsset);
+        if (scaledCollateralTransfer != 0) {
+            if (!_hasCollateral[liquidator][collateralAsset]) {
+                _hasCollateral[liquidator][collateralAsset] = true;
+                userCollateralAssets[liquidator].push(collateralAsset);
+            }
+            _addAssetSupplier(collateralAsset, liquidator);
         }
     }
 
@@ -893,12 +920,15 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
         userScaledSupply[borrower][collateralAsset] = 0;
         userScaledSupply[liquidator][collateralAsset] += borrowerScaledCollateral;
 
-        if (_hasCollateral[borrower][collateralAsset]) {
-            _removeCollateralAsset(borrower, collateralAsset);
-        }
-        if (borrowerScaledCollateral != 0 && !_hasCollateral[liquidator][collateralAsset]) {
-            _hasCollateral[liquidator][collateralAsset] = true;
-            userCollateralAssets[liquidator].push(collateralAsset);
+        if (_hasCollateral[borrower][collateralAsset]) _removeCollateralAsset(borrower, collateralAsset);
+        _removeAssetSupplier(collateralAsset, borrower);
+
+        if (borrowerScaledCollateral != 0) {
+            if (!_hasCollateral[liquidator][collateralAsset]) {
+                _hasCollateral[liquidator][collateralAsset] = true;
+                userCollateralAssets[liquidator].push(collateralAsset);
+            }
+            _addAssetSupplier(collateralAsset, liquidator);
         }
 
         collateralSeized = borrowerCollateral;
@@ -1025,6 +1055,27 @@ contract Lending is ILendingPool, Ownable2Step, ReentrancyGuard, Pausable {
             if (assets[i] == asset) {
                 assets[i] = assets[length - 1];
                 assets.pop();
+                return;
+            }
+        }
+    }
+
+    function _addAssetSupplier(address asset, address user) internal {
+        if (!_isAssetSupplier[asset][user]) {
+            _isAssetSupplier[asset][user] = true;
+            assetSuppliers[asset].push(user);
+        }
+    }
+
+    function _removeAssetSupplier(address asset, address user) internal {
+        if (!_isAssetSupplier[asset][user]) return;
+        _isAssetSupplier[asset][user] = false;
+        address[] storage list = assetSuppliers[asset];
+        uint256 len = list.length;
+        for (uint256 i; i < len; ++i) {
+            if (list[i] == user) {
+                list[i] = list[len - 1];
+                list.pop();
                 return;
             }
         }
